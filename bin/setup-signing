@@ -1,0 +1,231 @@
+#!/bin/bash
+
+set -e  # Exit on any error
+
+# Get the expo project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLS_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Source configuration and helpers (provides find_project_root function)
+source "$SCRIPT_DIR/../lib/config.sh"
+
+# Find project root (submodule-aware)
+if ! PROJECT_ROOT=$(find_project_root "$TOOLS_ROOT"); then
+    echo -e "${RED}ERROR: Cannot find Expo project root (app.json not found)${NC}"
+    echo -e "${RED}Searched in: $(dirname "$TOOLS_ROOT"), $TOOLS_ROOT, $PWD${NC}"
+    exit 1
+fi
+
+if [ ! -f "$SCRIPT_DIR/../lib/signing-helpers.sh" ]; then
+    echo -e "${RED}ERROR: signing-helpers.sh not found at $SCRIPT_DIR/../lib/signing-helpers.sh${NC}"
+    exit 1
+fi
+source "$SCRIPT_DIR/../lib/signing-helpers.sh"
+
+CONFIG_FILE="$PROJECT_ROOT/.signing-config"
+
+echo -e "${BLUE}╔═══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  Android Signing Configuration Setup                          ║${NC}"
+echo -e "${BLUE}╚═══════════════════════════════════════════════════════════════╝${NC}\n"
+
+# Check if config already exists
+if [ -f "$CONFIG_FILE" ]; then
+    echo -e "${YELLOW}WARNING: Signing configuration already exists${NC}"
+    echo -e "${BLUE}Config file: $CONFIG_FILE${NC}\n"
+
+    # Load existing config to show current settings
+    if load_signing_config "$CONFIG_FILE"; then
+        echo -e "${GREEN}Current configuration:${NC}"
+        echo -e "  Keystore: $KEYSTORE_PATH"
+        echo -e "  Alias: $KEY_ALIAS"
+        echo ""
+    fi
+
+    echo -e "${YELLOW}Reconfigure? This will overwrite existing settings. [y/N]${NC} "
+    read -r response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        echo -e "${BLUE}Setup cancelled${NC}"
+        exit 0
+    fi
+    echo ""
+fi
+
+# Get project name from app.json
+PROJECT_NAME="app"
+if [ -f "$PROJECT_ROOT/app.json" ]; then
+    PROJECT_NAME=$(grep -A 50 '"expo"' "$PROJECT_ROOT/app.json" | grep -m 1 '"name"' | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+fi
+
+echo -e "${BLUE}This wizard will configure Android app signing for your project.${NC}"
+echo -e "${BLUE}You'll need an existing keystore file or can generate a new one.${NC}\n"
+
+# Step 1: Keystore Path
+echo -e "${YELLOW}Step 1: Keystore File${NC}"
+DEFAULT_KEYSTORE="$HOME/keystores/$PROJECT_NAME.keystore"
+echo -e "${BLUE}Default: $DEFAULT_KEYSTORE${NC}\n"
+echo -e "${BLUE}Options:${NC}"
+echo -e "  ${BLUE}•${NC} Press Enter to use default"
+echo -e "  ${BLUE}•${NC} Enter filename only (e.g., 'myapp.keystore') → saved to ~/keystores/"
+echo -e "  ${BLUE}•${NC} Enter full path for custom location"
+echo -e "\n${BLUE}Enter your choice:${NC} "
+read -r KEYSTORE_PATH
+
+if [ -z "$KEYSTORE_PATH" ]; then
+    # Empty input - use default
+    KEYSTORE_PATH="$DEFAULT_KEYSTORE"
+elif [[ "$KEYSTORE_PATH" != *"/"* ]]; then
+    # No slash in input - treat as filename and prepend default directory
+    KEYSTORE_PATH="$HOME/keystores/$KEYSTORE_PATH"
+fi
+
+# Expand ~ to home directory
+KEYSTORE_PATH="${KEYSTORE_PATH/#\~/$HOME}"
+
+# Check if keystore exists
+if [ ! -f "$KEYSTORE_PATH" ]; then
+    echo -e "\n${RED}ERROR: Keystore not found: $KEYSTORE_PATH${NC}\n"
+    echo -e "${YELLOW}Generate a new keystore now? [Y/n]${NC} "
+    read -r generate_response
+
+    if [[ ! "$generate_response" =~ ^[Nn]$ ]]; then
+        # Generate new keystore
+        echo -e "\n${BLUE}Generating new keystore...${NC}\n"
+
+        # Ensure keystores directory exists
+        mkdir -p "$(dirname "$KEYSTORE_PATH")"
+
+        # Default alias
+        DEFAULT_ALIAS="${PROJECT_NAME}-key"
+        echo -e "${BLUE}Enter key alias (default: $DEFAULT_ALIAS):${NC} "
+        read -r KEY_ALIAS
+        if [ -z "$KEY_ALIAS" ]; then
+            KEY_ALIAS="$DEFAULT_ALIAS"
+        fi
+
+        echo -e "\n${BLUE}Running keytool to generate keystore...${NC}"
+        echo -e "${YELLOW}You will be prompted for:${NC}"
+        echo -e "  1. Keystore password (remember this!)"
+        echo -e "  2. Key password (can be same as keystore password)"
+        echo -e "  3. Your name, organization, etc.\n"
+
+        if keytool -genkeypair -v \
+            -storetype PKCS12 \
+            -keystore "$KEYSTORE_PATH" \
+            -alias "$KEY_ALIAS" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000; then
+
+            echo -e "\n${GREEN}Keystore generated successfully${NC}\n"
+
+            # Get passwords (they just entered them)
+            echo -e "${YELLOW}Now enter the password you just created for configuration:${NC}"
+            echo -e "${BLUE}Note: PKCS12 keystores use the same password for both keystore and key${NC}\n"
+            NEWLY_GENERATED=true
+        else
+            echo -e "\n${RED}ERROR: Failed to generate keystore${NC}"
+            exit 1
+        fi
+    else
+        echo -e "${RED}ERROR: Setup cancelled - keystore required${NC}"
+        exit 1
+    fi
+fi
+
+echo -e "${GREEN}Keystore file found${NC}\n"
+
+# Step 2: Key Alias
+if [ -z "$KEY_ALIAS" ]; then
+    echo -e "${YELLOW}Step 2: Key Alias${NC}"
+    echo -e "${BLUE}Enter the key alias:${NC} "
+    read -r KEY_ALIAS
+
+    if [ -z "$KEY_ALIAS" ]; then
+        echo -e "${RED}ERROR: Key alias is required${NC}"
+        exit 1
+    fi
+    echo ""
+fi
+
+# Step 3: Keystore Password
+echo -e "${YELLOW}Step 3: Keystore Password${NC}"
+echo -e "${BLUE}Enter the keystore password (input hidden):${NC} "
+read -s KEYSTORE_PASSWORD
+echo ""
+
+if [ -z "$KEYSTORE_PASSWORD" ]; then
+    echo -e "${RED}ERROR: Keystore password is required${NC}"
+    exit 1
+fi
+
+# Step 4: Key Password
+# For newly generated PKCS12 keystores, key password is same as keystore password
+if [ "${NEWLY_GENERATED:-false}" = "true" ]; then
+    echo -e "\n${YELLOW}Step 4: Key Password${NC}"
+    echo -e "${BLUE}Using same password for key (PKCS12 requirement)${NC}"
+    KEY_PASSWORD="$KEYSTORE_PASSWORD"
+else
+    echo -e "\n${YELLOW}Step 4: Key Password${NC}"
+    echo -e "${BLUE}Enter the key password (input hidden, press Enter if same as keystore password):${NC} "
+    read -s KEY_PASSWORD
+    echo ""
+
+    if [ -z "$KEY_PASSWORD" ]; then
+        KEY_PASSWORD="$KEYSTORE_PASSWORD"
+    fi
+fi
+
+# Validate credentials
+echo -e "\n${BLUE}Validating keystore credentials...${NC}"
+if ! validate_keystore "$KEYSTORE_PATH" "$KEYSTORE_PASSWORD" "$KEY_ALIAS"; then
+    echo -e "${RED}ERROR: Validation failed${NC}"
+    echo -e "${YELLOW}Check your credentials and try again${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}Credentials validated successfully${NC}\n"
+
+# Save configuration
+echo -e "${BLUE}Saving configuration...${NC}"
+if save_signing_config "$CONFIG_FILE" "$KEYSTORE_PATH" "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD"; then
+    echo -e "${GREEN}Configuration saved to: $CONFIG_FILE${NC}\n"
+else
+    echo -e "${RED}ERROR: Failed to save configuration${NC}"
+    exit 1
+fi
+
+# Add .signing-config to .gitignore if not already there
+GITIGNORE="$PROJECT_ROOT/.gitignore"
+if [ -f "$GITIGNORE" ]; then
+    if ! grep -q "^\.signing-config$" "$GITIGNORE"; then
+        echo "" >> "$GITIGNORE"
+        echo "# Android signing configuration (contains sensitive keys)" >> "$GITIGNORE"
+        echo ".signing-config" >> "$GITIGNORE"
+        echo -e "${GREEN}Added .signing-config to .gitignore${NC}\n"
+    fi
+else
+    echo -e "${YELLOW}WARNING: .gitignore not found, please manually add .signing-config to .gitignore${NC}\n"
+fi
+
+# Summary
+echo -e "${BLUE}╔═══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  Setup Complete                                                ║${NC}"
+echo -e "${BLUE}╚═══════════════════════════════════════════════════════════════╝${NC}\n"
+
+echo -e "${GREEN}Signing configuration complete${NC}\n"
+
+echo -e "${BLUE}Configuration saved to:${NC}   $CONFIG_FILE"
+echo -e "${BLUE}Keystore location:${NC}        $KEYSTORE_PATH"
+echo -e "${BLUE}Key alias:${NC}                $KEY_ALIAS\n"
+
+echo -e "${YELLOW}IMPORTANT SECURITY REMINDERS:${NC}"
+echo -e "  1. Backup your keystore file securely (you cannot recover it if lost)"
+echo -e "  2. Keep your passwords safe - store in a password manager"
+echo -e "  3. Without this keystore, you cannot update your app on Play Store\n"
+
+echo -e "${GREEN}You can now build release APKs and AABs:${NC}"
+echo -e "  ./expo-gdrive-sync/exb build release"
+echo -e "  ./expo-gdrive-sync/exb build playstore"
+echo -e "  ./expo-gdrive-sync/exb workflow playstore\n"
+
+echo -e "${YELLOW}To reconfigure: ./expo-gdrive-sync/exb setup-signing${NC}\n"

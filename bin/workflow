@@ -1,0 +1,124 @@
+#!/bin/bash
+
+set -e  # Exit on any error
+
+# Enable debug mode if DEBUG=1
+if [ "${DEBUG:-0}" = "1" ]; then
+    set -x
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLS_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Source configuration (provides find_project_root function)
+source "$SCRIPT_DIR/../lib/config.sh"
+
+# Find project root (submodule-aware)
+if ! PROJECT_ROOT=$(find_project_root "$TOOLS_ROOT"); then
+    echo -e "${RED}ERROR: Cannot find Expo project root (app.json not found)${NC}"
+    echo -e "${RED}Searched in: $(dirname "$TOOLS_ROOT"), $TOOLS_ROOT, $PWD${NC}"
+    exit 1
+fi
+
+echo -e "${BLUE}╔═══════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  Expo Build & Upload Workflow        ║${NC}"
+echo -e "${BLUE}╚═══════════════════════════════════════╝${NC}\n"
+
+# Validate we're in an Expo project
+if [ ! -f "$PROJECT_ROOT/app.json" ]; then
+    echo -e "${RED}ERROR: Not an Expo project${NC}"
+    echo -e "${RED}Could not find app.json in: $PROJECT_ROOT${NC}\n"
+    echo -e "This script must be run from an Expo project directory.\n"
+    exit 1
+fi
+
+# Parse arguments
+BUILD_TYPE=${1:-debug}
+GDRIVE_FOLDER=${2:-"$DEFAULT_UPLOAD_FOLDER"}
+
+# Show usage if help requested
+if [ "$BUILD_TYPE" = "-h" ] || [ "$BUILD_TYPE" = "--help" ]; then
+    echo -e "${YELLOW}Usage: ./expo-gdrive-sync/exb workflow [debug|release|playstore] [folder]${NC}"
+    echo ""
+    echo "Build types:"
+    echo "  debug      - Debug APK (no signing required)"
+    echo "  release    - Signed release APK (requires signing)"
+    echo "  playstore  - Signed AAB for Play Store (requires signing)"
+    echo ""
+    echo "Examples:"
+    echo "  ./expo-gdrive-sync/exb workflow debug"
+    echo "  ./expo-gdrive-sync/exb workflow release MyApp/Builds"
+    echo "  ./expo-gdrive-sync/exb workflow playstore"
+    echo ""
+    echo "Builds and uploads to Google Drive in one command."
+    exit 0
+fi
+
+# Validate build type
+case $BUILD_TYPE in
+    debug|release|playstore)
+        ;;
+    *)
+        echo -e "${RED}Invalid build type: $BUILD_TYPE${NC}"
+        echo -e "${YELLOW}Usage: ./expo-gdrive-sync/exb workflow [debug|release|playstore] [folder]${NC}"
+        exit 1
+        ;;
+esac
+
+# Check if build exists
+if [ ! -f "$SCRIPT_DIR/build" ]; then
+    echo -e "${RED}ERROR: build not found in $SCRIPT_DIR${NC}"
+    exit 1
+fi
+
+# Check if upload exists
+if [ ! -f "$SCRIPT_DIR/upload" ]; then
+    echo -e "${RED}ERROR: upload not found in $SCRIPT_DIR${NC}"
+    exit 1
+fi
+
+# Make scripts executable if needed
+chmod +x "$SCRIPT_DIR/build" 2>/dev/null || true
+chmod +x "$SCRIPT_DIR/upload" 2>/dev/null || true
+
+# Step 1: Build
+echo -e "${YELLOW}════════════════════════════════════════${NC}"
+echo -e "${YELLOW}   STEP 1: Building ($BUILD_TYPE)${NC}"
+echo -e "${YELLOW}════════════════════════════════════════${NC}\n"
+
+if "$SCRIPT_DIR/build" "$BUILD_TYPE"; then
+    echo -e "\n${GREEN}Build completed successfully${NC}\n"
+else
+    echo -e "\n${RED}ERROR: Build failed${NC}"
+    echo -e "${YELLOW}Upload skipped due to build failure${NC}"
+    exit 1
+fi
+
+# Step 2: Upload
+echo -e "${YELLOW}════════════════════════════════════════${NC}"
+echo -e "${YELLOW}   STEP 2: Uploading to Google Drive${NC}"
+echo -e "${YELLOW}════════════════════════════════════════${NC}\n"
+
+# Check if there are files to upload
+if [ ! -d "$TEMP_DIR" ] || [ -z "$(ls -A $TEMP_DIR 2>/dev/null)" ]; then
+    echo -e "${YELLOW}WARNING: No files found in $TEMP_DIR${NC}"
+    echo -e "${YELLOW}Nothing to upload${NC}"
+    exit 0
+fi
+
+# Upload all files from temp directory
+if "$SCRIPT_DIR/upload" "$TEMP_DIR"/* "$GDRIVE_FOLDER"; then
+    echo -e "\n${GREEN}Upload completed successfully${NC}\n"
+else
+    echo -e "\n${RED}ERROR: Upload failed${NC}"
+    exit 1
+fi
+
+# Final Summary
+echo -e "${BLUE}╔═══════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  Workflow Complete                    ║${NC}"
+echo -e "${BLUE}╚═══════════════════════════════════════╝${NC}"
+echo -e "${GREEN}Build: Success${NC}"
+echo -e "${GREEN}Upload: Success${NC}"
+echo -e "${BLUE}Location: ${GDRIVE_REMOTE}${GDRIVE_FOLDER}${NC}"
+echo -e "\n${GREEN}All operations completed successfully${NC}"

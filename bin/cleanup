@@ -1,0 +1,283 @@
+#!/bin/bash
+
+set -e  # Exit on any error
+
+# Enable debug mode if DEBUG=1
+if [ "${DEBUG:-0}" = "1" ]; then
+    set -x
+fi
+
+# Get the expo project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLS_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Source configuration (provides find_project_root function)
+source "$SCRIPT_DIR/../lib/config.sh"
+
+# Find project root (submodule-aware)
+if ! PROJECT_ROOT=$(find_project_root "$TOOLS_ROOT"); then
+    echo -e "${RED}ERROR: Cannot find Expo project root (app.json not found)${NC}"
+    echo -e "${RED}Searched in: $(dirname "$TOOLS_ROOT"), $TOOLS_ROOT, $PWD${NC}"
+    exit 1
+fi
+
+echo -e "${BLUE}╔═══════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  Expo Build Cleanup Script            ║${NC}"
+echo -e "${BLUE}╚═══════════════════════════════════════╝${NC}\n"
+
+# Default values
+KEEP_LAST=0
+CLEAN_GRADLE=false
+DRY_RUN=false
+FORCE=false
+
+# Show usage
+show_usage() {
+    echo -e "${YELLOW}Usage: ./expo-gdrive-sync/exb cleanup [OPTIONS]${NC}"
+    echo ""
+    echo "Options:"
+    echo "  -k, --keep <N>       Keep last N builds (default: 0 = delete all)"
+    echo "  -g, --gradle         Also clean gradle cache and build directories"
+    echo "  -d, --dry-run        Show what would be deleted without deleting"
+    echo "  -f, --force          Skip confirmation prompts"
+    echo "  -h, --help           Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  ./expo-gdrive-sync/exb cleanup"
+    echo "  ./expo-gdrive-sync/exb cleanup --keep 3"
+    echo "  ./expo-gdrive-sync/exb cleanup --gradle"
+    echo "  ./expo-gdrive-sync/exb cleanup --dry-run"
+    echo ""
+    echo "Build directory: $TEMP_DIR"
+    exit 0
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -k|--keep)
+            KEEP_LAST="$2"
+            shift 2
+            ;;
+        -g|--gradle)
+            CLEAN_GRADLE=true
+            shift
+            ;;
+        -d|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -f|--force)
+            FORCE=true
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}\n"
+            show_usage
+            ;;
+    esac
+done
+
+# Validate KEEP_LAST is a number
+if ! [[ "$KEEP_LAST" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}Error: --keep value must be a number${NC}"
+    exit 1
+fi
+
+# Function to get human-readable size
+get_size() {
+    if [ -d "$1" ]; then
+        du -sh "$1" 2>/dev/null | cut -f1 || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# Function to clean build artifacts
+clean_build_artifacts() {
+    if [ ! -d "$TEMP_DIR" ]; then
+        echo -e "${YELLOW}Build directory doesn't exist: $TEMP_DIR${NC}"
+        return 0
+    fi
+
+    local total_size=$(get_size "$TEMP_DIR")
+    local file_count=$(find "$TEMP_DIR" -type f \( -name "*.apk" -o -name "*.aab" \) 2>/dev/null | wc -l)
+
+    echo -e "${BLUE}Build artifacts location: $TEMP_DIR${NC}"
+    echo -e "${BLUE}Total size: $total_size${NC}"
+    echo -e "${BLUE}Files found: $file_count (.apk and .aab)${NC}\n"
+
+    if [ "$file_count" -eq 0 ]; then
+        echo -e "${YELLOW}No build artifacts found${NC}"
+        return 0
+    fi
+
+    # Get all build files sorted by modification time (newest first)
+    local files=($(find "$TEMP_DIR" -type f \( -name "*.apk" -o -name "*.aab" \) -printf "%T@ %p\n" | sort -rn | cut -d' ' -f2-))
+
+    # Determine files to delete
+    local files_to_delete=()
+    local files_to_keep=()
+
+    if [ "$KEEP_LAST" -gt 0 ]; then
+        # Keep last N files
+        local count=0
+        for file in "${files[@]}"; do
+            if [ "$count" -lt "$KEEP_LAST" ]; then
+                files_to_keep+=("$file")
+            else
+                files_to_delete+=("$file")
+            fi
+            ((count++))
+        done
+    else
+        # Delete all files
+        files_to_delete=("${files[@]}")
+    fi
+
+    # Show what will be kept
+    if [ ${#files_to_keep[@]} -gt 0 ]; then
+        echo -e "${GREEN}Files to keep (${#files_to_keep[@]}):${NC}"
+        for file in "${files_to_keep[@]}"; do
+            local size=$(du -h "$file" 2>/dev/null | cut -f1)
+            local name=$(basename "$file")
+            echo -e "  [KEEP] $name ($size)"
+        done
+        echo ""
+    fi
+
+    # Show what will be deleted
+    if [ ${#files_to_delete[@]} -gt 0 ]; then
+        echo -e "${YELLOW}Files to delete (${#files_to_delete[@]}):${NC}"
+        local total_delete_size=0
+        for file in "${files_to_delete[@]}"; do
+            local size=$(du -h "$file" 2>/dev/null | cut -f1)
+            local name=$(basename "$file")
+            echo -e "  [DELETE] $name ($size)"
+        done
+        echo ""
+
+        # Confirm deletion unless force flag is set
+        if [ "$DRY_RUN" = false ] && [ "$FORCE" = false ]; then
+            echo -e "${YELLOW}Delete ${#files_to_delete[@]} file(s)? [y/N]${NC} "
+            read -r response
+            if [[ ! "$response" =~ ^[Yy]$ ]]; then
+                echo -e "${BLUE}Cleanup cancelled${NC}"
+                return 0
+            fi
+        fi
+
+        # Delete files
+        if [ "$DRY_RUN" = true ]; then
+            echo -e "${BLUE}[DRY RUN] Would delete ${#files_to_delete[@]} file(s)${NC}"
+        else
+            local deleted=0
+            for file in "${files_to_delete[@]}"; do
+                if rm -f "$file" 2>/dev/null; then
+                    ((deleted++))
+                fi
+            done
+            echo -e "${GREEN}Deleted $deleted file(s)${NC}"
+
+            # Remove directory if empty
+            if [ -z "$(ls -A "$TEMP_DIR" 2>/dev/null)" ]; then
+                rmdir "$TEMP_DIR" 2>/dev/null || true
+                echo -e "${BLUE}Removed empty build directory${NC}"
+            fi
+        fi
+    else
+        echo -e "${YELLOW}No files to delete${NC}"
+    fi
+}
+
+# Function to clean gradle cache
+clean_gradle_cache() {
+    if [ ! -d "$PROJECT_ROOT/android" ]; then
+        echo -e "${YELLOW}Android directory not found, skipping gradle cleanup${NC}"
+        return 0
+    fi
+
+    echo -e "\n${YELLOW}═══ Gradle Cache Cleanup ═══${NC}\n"
+
+    local gradle_dirs=(
+        "$PROJECT_ROOT/android/app/build"
+        "$PROJECT_ROOT/android/build"
+        "$PROJECT_ROOT/android/.gradle"
+    )
+
+    local total_size=0
+    local dirs_exist=()
+
+    # Check which directories exist and calculate total size
+    for dir in "${gradle_dirs[@]}"; do
+        if [ -d "$dir" ]; then
+            dirs_exist+=("$dir")
+            local size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+            echo -e "${BLUE}Found: $dir ($size)${NC}"
+        fi
+    done
+
+    if [ ${#dirs_exist[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No gradle cache directories found${NC}"
+        return 0
+    fi
+
+    echo ""
+
+    # Confirm deletion unless force flag is set
+    if [ "$DRY_RUN" = false ] && [ "$FORCE" = false ]; then
+        echo -e "${YELLOW}Delete gradle cache directories? [y/N]${NC} "
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            echo -e "${BLUE}Gradle cleanup cancelled${NC}"
+            return 0
+        fi
+    fi
+
+    # Delete directories
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${BLUE}[DRY RUN] Would delete ${#dirs_exist[@]} gradle cache director(ies)${NC}"
+    else
+        local deleted=0
+        for dir in "${dirs_exist[@]}"; do
+            if rm -rf "$dir" 2>/dev/null; then
+                ((deleted++))
+                echo -e "${GREEN}Deleted: $dir${NC}"
+            else
+                echo -e "${RED}ERROR: Failed to delete: $dir${NC}"
+            fi
+        done
+        echo -e "${GREEN}Cleaned $deleted gradle cache director(ies)${NC}"
+    fi
+}
+
+# Main execution
+echo -e "${BLUE}Cleanup mode:${NC}"
+[ "$KEEP_LAST" -gt 0 ] && echo -e "  Keep last: $KEEP_LAST builds" || echo -e "  Delete all builds"
+[ "$CLEAN_GRADLE" = true ] && echo -e "  Clean gradle cache: Yes"
+[ "$DRY_RUN" = true ] && echo -e "  ${YELLOW}DRY RUN MODE (no files will be deleted)${NC}"
+[ "$FORCE" = true ] && echo -e "  Skip confirmations: Yes"
+echo ""
+
+# Clean build artifacts
+clean_build_artifacts
+
+# Clean gradle cache if requested
+if [ "$CLEAN_GRADLE" = true ]; then
+    clean_gradle_cache
+fi
+
+# Summary
+echo -e "\n${BLUE}╔═══════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  Cleanup Complete                     ║${NC}"
+echo -e "${BLUE}╚═══════════════════════════════════════╝${NC}"
+
+if [ "$DRY_RUN" = true ]; then
+    echo -e "${YELLOW}This was a dry run - no files were deleted${NC}"
+    echo -e "${BLUE}Run without --dry-run to actually delete files${NC}"
+else
+    echo -e "${GREEN}Cleanup completed successfully${NC}"
+fi

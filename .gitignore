@@ -1,0 +1,36 @@
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+test/
+temp/
+
+# Local configuration
+config.local.sh
+
+# Logs
+*.log
+
+# rclone configuration
+.rclone.conf
+
+# Build output directory
+builds/
+../builds/
+
+# Signing configuration (project-level, stored in parent)
+../.signing-config
+
+# Android signing files - NEVER commit these!
+# Losing your keystore means you cannot update your app on Play Store
+*.keystore
+*.jks
+signing.properties
+android/app/release.keystore
+android/app/*.keystore
+android/signing.properties

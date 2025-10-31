@@ -1,0 +1,329 @@
+#!/bin/bash
+
+set -e  # Exit on any error
+
+# Enable debug mode if DEBUG=1
+if [ "${DEBUG:-0}" = "1" ]; then
+    set -x
+fi
+
+# Get the expo project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLS_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Source configuration (provides find_project_root function)
+source "$SCRIPT_DIR/../lib/config.sh"
+
+# Find project root (submodule-aware)
+if ! PROJECT_ROOT=$(find_project_root "$TOOLS_ROOT"); then
+    echo -e "${RED}ERROR: Cannot find Expo project root (app.json not found)${NC}"
+    echo -e "${RED}Searched in: $(dirname "$TOOLS_ROOT"), $TOOLS_ROOT, $PWD${NC}"
+    exit 1
+fi
+
+# Source signing helpers
+source "$SCRIPT_DIR/../lib/signing-helpers.sh"
+
+# Load project signing configuration if it exists
+if [ -f "$PROJECT_ROOT/.signing-config" ]; then
+    load_signing_config "$PROJECT_ROOT/.signing-config"
+fi
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Extract app name from app.json (expo.name field)
+APP_NAME="app"
+if [ -f "$PROJECT_ROOT/app.json" ]; then
+    APP_NAME=$(grep -A 50 '"expo"' "$PROJECT_ROOT/app.json" | grep -m 1 '"name"' | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    if [ -z "$APP_NAME" ]; then
+        APP_NAME="app"
+    fi
+    # Replace spaces with hyphens for filename
+    APP_NAME=$(echo "$APP_NAME" | tr ' ' '-')
+fi
+
+# Inject signing configuration into gradle after prebuild
+inject_signing_to_gradle() {
+    local gradle_file="$PROJECT_ROOT/android/app/build.gradle"
+
+    if [ ! -f "$gradle_file" ]; then
+        echo -e "${YELLOW}WARNING: build.gradle not found, skipping signing injection${NC}"
+        return 0
+    fi
+
+    # Only inject if we have signing credentials
+    if [ -n "$KEYSTORE_PATH" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+        echo -e "${BLUE}Injecting signing configuration into gradle...${NC}"
+        if inject_gradle_signing_config "$gradle_file" "$KEYSTORE_PATH" "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD"; then
+            echo -e "${GREEN}Signing configuration injected${NC}"
+        else
+            echo -e "${YELLOW}WARNING: Failed to inject signing configuration${NC}"
+        fi
+    fi
+}
+
+# Check signing configuration for release builds
+check_signing_config() {
+    echo -e "${BLUE}Checking signing configuration...${NC}"
+
+    # Check if any signing method is configured
+    local has_env_vars=false
+    local has_signing_props=false
+    local keystore_exists=false
+
+    # Check environment variables
+    if [ -n "$KEYSTORE_PATH" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+        has_env_vars=true
+        if [ -f "$KEYSTORE_PATH" ]; then
+            if [ -r "$KEYSTORE_PATH" ]; then
+                keystore_exists=true
+                echo -e "${GREEN}Signing configured via environment variables${NC}"
+                echo -e "${BLUE}  Keystore: $KEYSTORE_PATH${NC}"
+            else
+                echo -e "${RED}ERROR: Keystore file not readable: $KEYSTORE_PATH${NC}"
+                echo -e "${RED}  Run: chmod 644 $KEYSTORE_PATH${NC}\n"
+                return 2
+            fi
+        else
+            echo -e "${RED}ERROR: Keystore file not found: $KEYSTORE_PATH${NC}\n"
+            return 2
+        fi
+    fi
+
+    # Check signing.properties file
+    if [ -f "$PROJECT_ROOT/android/signing.properties" ]; then
+        has_signing_props=true
+        # Try to extract keystore path from signing.properties
+        local props_keystore=$(grep "^KEYSTORE_PATH=" "$PROJECT_ROOT/android/signing.properties" | cut -d'=' -f2)
+        if [ -n "$props_keystore" ]; then
+            # Handle relative paths
+            if [[ "$props_keystore" != /* ]]; then
+                props_keystore="$PROJECT_ROOT/android/$props_keystore"
+            fi
+            if [ -f "$props_keystore" ]; then
+                keystore_exists=true
+                echo -e "${GREEN}Signing configured via signing.properties${NC}"
+                echo -e "${BLUE}  Keystore: $props_keystore${NC}"
+            fi
+        fi
+    fi
+
+    # If no configuration found, show error
+    if [ "$has_env_vars" = false ] && [ "$has_signing_props" = false ]; then
+        echo -e "${RED}ERROR: Android signing not configured${NC}"
+        echo -e "${YELLOW}Release builds require a signing keystore.${NC}\n"
+        echo -e "${BLUE}Setup:${NC}"
+        echo -e "  1. Generate keystore:"
+        echo -e "     keytool -genkeypair -v -storetype PKCS12 \\"
+        echo -e "       -keystore my-release-key.keystore \\"
+        echo -e "       -alias my-key-alias -keyalg RSA -keysize 2048 -validity 10000\n"
+        echo -e "  2. Set environment variables:"
+        echo -e "     export KEYSTORE_PATH=\"/path/to/my-release-key.keystore\""
+        echo -e "     export KEYSTORE_PASSWORD=\"your-keystore-password\""
+        echo -e "     export KEY_ALIAS=\"my-key-alias\""
+        echo -e "     export KEY_PASSWORD=\"your-key-password\"\n"
+        echo -e "See: $SCRIPT_DIR/docs/SIGNING_SETUP.md\n"
+        return 3
+    fi
+
+    if [ "$keystore_exists" = false ]; then
+        echo -e "${RED}ERROR: Signing configuration found but keystore file is missing${NC}\n"
+        return 2
+    fi
+
+    return 0
+}
+
+# Create temp directory and clean old builds
+mkdir -p "$TEMP_DIR"
+rm -f "$TEMP_DIR"/*.apk "$TEMP_DIR"/*.aab 2>/dev/null || true
+
+echo -e "${BLUE}╔═══════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  Expo Build Script                    ║${NC}"
+echo -e "${BLUE}╚═══════════════════════════════════════╝${NC}\n"
+
+# Validate we're in an Expo project
+if [ ! -f "$PROJECT_ROOT/app.json" ]; then
+    echo -e "${RED}ERROR: Not an Expo project${NC}"
+    echo -e "${RED}Could not find app.json in: $PROJECT_ROOT${NC}\n"
+    echo -e "This script must be run from an Expo project."
+    echo -e "Expected: $PROJECT_ROOT/app.json\n"
+    exit 1
+fi
+
+# Parse arguments
+BUILD_TYPE=${1:-debug}
+
+
+# Build Debug APK
+build_debug() {
+    echo -e "${YELLOW}═══ Building DEBUG APK ═══${NC}\n"
+
+    cd "$PROJECT_ROOT"
+
+    echo -e "${BLUE}Running expo prebuild --clean...${NC}"
+    npx expo prebuild --clean
+
+    cd android
+    ./gradlew assembleDebug
+    cd ..
+
+    DEBUG_APK="$PROJECT_ROOT/android/app/build/outputs/apk/debug/app-debug.apk"
+
+    if [ -f "$DEBUG_APK" ]; then
+        NEW_NAME="${APP_NAME}-debug-${TIMESTAMP}.apk"
+        TEMP_FILE="$TEMP_DIR/$NEW_NAME"
+
+        cp "$DEBUG_APK" "$TEMP_FILE"
+        echo -e "${GREEN}Debug APK built successfully${NC}"
+        echo -e "${BLUE}  Original: $DEBUG_APK${NC}"
+        echo -e "${BLUE}  Saved to: $TEMP_FILE${NC}"
+    else
+        echo -e "${RED}ERROR: Debug APK not found at expected location${NC}\n"
+        return 1
+    fi
+}
+
+# Build Release APK
+build_release_apk() {
+    echo -e "${YELLOW}═══ Building RELEASE APK ═══${NC}\n"
+
+    # Check signing configuration before building
+    if ! check_signing_config; then
+        return 1
+    fi
+
+    cd "$PROJECT_ROOT"
+
+    echo -e "${BLUE}Running expo prebuild --clean...${NC}"
+    npx expo prebuild --clean
+
+    # Inject signing configuration after prebuild
+    inject_signing_to_gradle
+
+    cd android
+    ./gradlew assembleRelease
+    cd ..
+
+    RELEASE_APK="$PROJECT_ROOT/android/app/build/outputs/apk/release/app-release.apk"
+
+    if [ -f "$RELEASE_APK" ]; then
+        NEW_NAME="${APP_NAME}-release-${TIMESTAMP}.apk"
+        TEMP_FILE="$TEMP_DIR/$NEW_NAME"
+
+        cp "$RELEASE_APK" "$TEMP_FILE"
+        echo -e "${GREEN}Release APK built successfully${NC}"
+        echo -e "${BLUE}  Original: $RELEASE_APK${NC}"
+        echo -e "${BLUE}  Saved to: $TEMP_FILE${NC}"
+    else
+        echo -e "${RED}ERROR: Release APK not found at expected location${NC}\n"
+        return 1
+    fi
+}
+
+# Build Release AAB (Play Store)
+build_release_aab() {
+    echo -e "${YELLOW}═══ Building RELEASE AAB (Play Store) ═══${NC}\n"
+
+    # Check signing configuration before building
+    if ! check_signing_config; then
+        return 1
+    fi
+
+    cd "$PROJECT_ROOT"
+
+    echo -e "${BLUE}Running expo prebuild --clean...${NC}"
+    npx expo prebuild --clean
+
+    # Inject signing configuration after prebuild
+    inject_signing_to_gradle
+
+    cd android
+    ./gradlew bundleRelease
+    cd ..
+
+    RELEASE_AAB="$PROJECT_ROOT/android/app/build/outputs/bundle/release/app-release.aab"
+
+    if [ -f "$RELEASE_AAB" ]; then
+        NEW_NAME="${APP_NAME}-playstore-${TIMESTAMP}.aab"
+        TEMP_FILE="$TEMP_DIR/$NEW_NAME"
+
+        cp "$RELEASE_AAB" "$TEMP_FILE"
+        echo -e "${GREEN}Release AAB built successfully${NC}"
+        echo -e "${BLUE}  Original: $RELEASE_AAB${NC}"
+        echo -e "${BLUE}  Saved to: $TEMP_FILE${NC}"
+    else
+        echo -e "${RED}ERROR: Release AAB not found at expected location${NC}\n"
+        return 1
+    fi
+}
+
+# Track success/failure
+SUCCESS_COUNT=0
+FAILURE_COUNT=0
+
+# Execute based on argument
+case $BUILD_TYPE in
+    debug)
+        if build_debug; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+        else
+            FAILURE_COUNT=$((FAILURE_COUNT + 1))
+        fi
+        ;;
+    release)
+        if build_release_apk; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+        else
+            FAILURE_COUNT=$((FAILURE_COUNT + 1))
+        fi
+        ;;
+    playstore)
+        if build_release_aab; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+        else
+            FAILURE_COUNT=$((FAILURE_COUNT + 1))
+        fi
+        ;;
+    *)
+        echo -e "${RED}Invalid build type: $BUILD_TYPE${NC}"
+        echo -e "${YELLOW}Usage: ./expo-gdrive-sync/exb build [debug|release|playstore]${NC}"
+        echo ""
+        echo "Build types:"
+        echo "  debug      - Debug APK (no signing required)"
+        echo "  release    - Signed release APK (requires signing)"
+        echo "  playstore  - Signed AAB for Play Store (requires signing)"
+        echo ""
+        echo "Examples:"
+        echo "  ./expo-gdrive-sync/exb build debug"
+        echo "  ./expo-gdrive-sync/exb build release"
+        echo "  ./expo-gdrive-sync/exb build playstore"
+        echo ""
+        echo "Build files are saved to: $TEMP_DIR"
+        exit 1
+        ;;
+esac
+
+# Summary
+echo -e "\n${BLUE}╔═══════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  Build Summary                        ║${NC}"
+echo -e "${BLUE}╚═══════════════════════════════════════╝${NC}"
+echo -e "${GREEN}Successful: $SUCCESS_COUNT${NC}"
+echo -e "${RED}Failed: $FAILURE_COUNT${NC}"
+echo -e "${BLUE}Timestamp: $TIMESTAMP${NC}"
+echo -e "${BLUE}Build location: $TEMP_DIR${NC}"
+
+if [ $FAILURE_COUNT -eq 0 ]; then
+    echo -e "\n${GREEN}All builds completed successfully${NC}"
+
+    # Show disk space info
+    if [ -d "$TEMP_DIR" ]; then
+        BUILD_SIZE=$(du -sh "$TEMP_DIR" 2>/dev/null | cut -f1)
+        echo -e "${BLUE}Total build size: $BUILD_SIZE${NC}"
+        echo -e "\nTIP: Run ./expo-gdrive-sync/exb cleanup to manage build artifacts"
+    fi
+    exit 0
+else
+    echo -e "\n${YELLOW}Some builds failed. Check output above.${NC}"
+    exit 1
+fi

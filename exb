@@ -1,0 +1,75 @@
+#!/bin/bash
+
+# Expo Build Tools (exb) - Command dispatcher
+# Usage: ./exb <command> [args...]
+
+set -e
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN_DIR="$SCRIPT_DIR/bin"
+
+# Color codes
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# Show usage information
+show_usage() {
+    echo -e "${BLUE}Expo Build Tools (exb)${NC}"
+    echo ""
+    echo "Usage: ./exb <command> [args...]"
+    echo ""
+    echo "Commands:"
+    echo "  build           Build Android (debug|release|playstore)"
+    echo "  upload          Upload to Google Drive"
+    echo "  workflow        Build and upload"
+    echo "  cleanup         Clean build artifacts"
+    echo "  setup-signing   Configure signing"
+    echo ""
+    echo "Examples:"
+    echo "  ./exb build debug"
+    echo "  ./exb workflow playstore"
+    echo "  ./exb cleanup --keep 5"
+}
+
+# Check if command is provided
+if [ $# -eq 0 ]; then
+    show_usage
+    exit 0
+fi
+
+COMMAND="$1"
+shift  # Remove command from arguments
+
+# Handle help flags
+if [ "$COMMAND" = "-h" ] || [ "$COMMAND" = "--help" ] || [ "$COMMAND" = "help" ]; then
+    show_usage
+    exit 0
+fi
+
+# Dispatch to appropriate command
+case "$COMMAND" in
+    build)
+        exec "$BIN_DIR/build" "$@"
+        ;;
+    upload)
+        exec "$BIN_DIR/upload" "$@"
+        ;;
+    workflow)
+        exec "$BIN_DIR/workflow" "$@"
+        ;;
+    cleanup)
+        exec "$BIN_DIR/cleanup" "$@"
+        ;;
+    setup-signing)
+        exec "$BIN_DIR/setup-signing" "$@"
+        ;;
+    *)
+        echo -e "${RED}Error: Unknown command '$COMMAND'${NC}"
+        echo ""
+        show_usage
+        exit 1
+        ;;
+esac
